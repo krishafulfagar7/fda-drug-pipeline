@@ -1,12 +1,21 @@
+"""
+scraper.py
+---------
+Drop-in replacement that pulls data from the official OpenFDA Drugs@FDA API
+instead of scraping Drugs.com.
+
+API docs: https://open.fda.gov/apis/drug/drugsfda/
+"""
+
 import logging
 import os
-from dotenv import load_dotenv
+import time
+from datetime import datetime
 from typing import Optional
 
-from bs4 import BeautifulSoup
-from datetime import datetime
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 from tqdm import tqdm
 
 from .config import CONFIG, LocalConfig, AWSConfig, GCPConfig
@@ -14,15 +23,9 @@ from .load_data import (
     load_existing_data,
     export_data_to_local,
     export_data_to_s3,
-    export_data_to_cloud_storage
+    export_data_to_cloud_storage,
 )
-
-from new_drug_approvals_scraper.utils import (
-    initialize_model,
-    extract_generic_and_admin,
-    clean_company_name
-)
-
+from new_drug_approvals_scraper.utils import initialize_model, clean_company_name
 from new_drug_approvals_scraper.classification import (
     make_classification,
     DRUG_CATEGORIES,
@@ -30,147 +33,219 @@ from new_drug_approvals_scraper.classification import (
     DRUG_CLASSIFICATION_TEMPLATE,
     DISEASE_CATEGORIES,
     DISEASE_DESCRIPTION,
-    DISEASE_CLASSIFICATION_TEMPLATE
+    DISEASE_CLASSIFICATION_TEMPLATE,
 )
 
-# Initialize constants: date format, and browser headers
-pd.set_option('display.max_columns', None)
-pd.set_option('display.max_rows', None)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", None)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+FDA_API_BASE = "https://api.fda.gov/drug/drugsfda.json"
+RESULTS_PER_PAGE = 99
+
+
+def fetch_fda_approvals(start_year: int, end_year: int) -> list[dict]:
+    all_records: list[dict] = []
+    skip = 0
+
+    date_from = f"{start_year}0101"
+    date_to = f"{end_year}1231"
+
+    logging.info(f"Fetching FDA approvals from {start_year} to {end_year}...")
+
+    while True:
+        params = {
+            "search": "submissions.submission_status_date:[" + date_from + "+TO+" + date_to + "]",
+            "limit": RESULTS_PER_PAGE,
+            "skip": skip,
+        }
+
+        try:
+            from urllib.parse import quote
+
+            encoded_search = quote(
+                "submissions.submission_status_date:[" + date_from + "+TO+" + date_to + "]",
+                safe=":+[]",
+            )
+            url = (
+                f"{FDA_API_BASE}?search={encoded_search}"
+                f"&limit={RESULTS_PER_PAGE}&skip={skip}"
+            )
+            response = requests.get(url, timeout=30)
+        except requests.RequestException as e:
+            logging.error(f"Request failed: {e}")
+            break
+
+        if response.status_code == 404:
+            break
+        if response.status_code != 200:
+            logging.error(f"FDA API error {response.status_code}: {response.text[:200]}")
+            break
+
+        data = response.json()
+        results = data.get("results", [])
+        if not results:
+            break
+
+        all_records.extend(results)
+        total = data.get("meta", {}).get("results", {}).get("total", "?")
+        logging.info(f"  Fetched {len(all_records)} / {total} records...")
+
+        if len(results) < RESULTS_PER_PAGE:
+            break
+
+        skip += RESULTS_PER_PAGE
+        time.sleep(0.5)  # be polite to the API
+
+    return all_records
+
+
+def _format_openfda_date(date_yyyymmdd: str) -> Optional[str]:
+    if not date_yyyymmdd:
+        return None
+    try:
+        dt = datetime.strptime(date_yyyymmdd, "%Y%m%d")
+    except ValueError:
+        return None
+    return dt.strftime(CONFIG.DATE_FORMAT)
+
+
+def parse_fda_record(record: dict) -> dict:
+    app_number = record.get("application_number", "")
+
+    sponsor = clean_company_name(record.get("sponsor_name", "") or "")
+
+    products = record.get("products") or []
+    first_product = products[0] if products else {}
+
+    drug_name = (first_product.get("brand_name") or "").strip()
+
+    active_ingredients = first_product.get("active_ingredients")
+    generic_names: list[str] = []
+    if isinstance(active_ingredients, list):
+        for ing in active_ingredients:
+            if isinstance(ing, dict):
+                name = (ing.get("name") or "").strip()
+                if name:
+                    generic_names.append(name)
+    drug_generic_name = ", ".join(generic_names) if generic_names else None
+
+    dosage_form = (first_product.get("dosage_form") or "").strip()
+    route = (first_product.get("route") or "").strip()
+    mode_administration = " via ".join([p for p in [dosage_form, route] if p]) or None
+
+    submissions = record.get("submissions") or []
+    approved = [
+        s
+        for s in submissions
+        if isinstance(s, dict) and (s.get("submission_status") or "").upper() == "AP"
+    ]
+    approved.sort(key=lambda s: s.get("submission_status_date", ""), reverse=True)
+    latest = approved[0] if approved else {}
+
+    approval_date_raw = latest.get("submission_status_date", "") if latest else ""
+    approval_date = _format_openfda_date(approval_date_raw)
+
+    submission_type = (latest.get("submission_type") or "").strip() if latest else ""
+    marketing_status = (first_product.get("marketing_status") or "").strip()
+
+    # The Drugs@FDA endpoint doesn't provide a clean "Treatment for" field like Drugs.com.
+    treatment_for = None
+    description = " | ".join([p for p in [submission_type, marketing_status] if p]) or ""
+
+    return {
+        "drug_name": drug_name,
+        "drug_generic_name": drug_generic_name,
+        "mode_administration": mode_administration,
+        "description": description,
+        "Date of Approval": approval_date,
+        "Company": sponsor,
+        "Treatment for": treatment_for,
+        "application_number": app_number,
+    }
 
 
 def scrape_new_drug_approvals_data(openai_api_key: Optional[str] = None) -> None:
-    """
-    Scrapes drug approval data from Drugs.com and updates a local or cloud-hosted dataset.
-
-    This function scrapes drug approvals data year by year from Drugs.com. It is designed to:
-    - Check if a drug has already been scraped (based on its name) to avoid re-scraping duplicate data.
-    - Export the resulting dataset to a local file, AWS S3, or Google Cloud Storage based on the configuration.
-
-    **Workflow**:
-    1. Loads the existing dataset (if any) to check for already scraped drugs.
-    2. Iterates over years, starting from the current year and going backward, scraping new approvals.
-    3. For each drug:
-        - Extracts key metadata: name, generic name, mode of administration, approval date, company, etc.
-        - Classifies the drug and its corresponding disease using a language model (OpenAI API).
-    4. Updates the dataset and exports it to the configured storage.
-
-    Args:
-        openai_api_key (Optional[str]): The OpenAI API key used for classification. If not provided,
-                                        the function attempts to load it from environment variables.
-
-    Raises:
-        ValueError: If the OpenAI API key is not provided and cannot be loaded from the environment.
-        RuntimeError: If the storage configuration (`CONFIG`) is invalid.
-
-    Returns:
-        None: All data is either exported to a csv file or stored in the cloud.
-    """
-    # Initialize the language model with API key
     if not openai_api_key:
         load_dotenv()
-        openai_api_key = os.getenv('OPENAI_API_KEY')
+        openai_api_key = os.getenv("OPENAI_API_KEY")
         if not openai_api_key:
-            raise ValueError('OpenAI API key not found. Please provide it as an argument or set it as an environment variable.')
+            raise ValueError(
+                "OpenAI API key not found. Please provide it as an argument or set OPENAI_API_KEY."
+            )
 
     chat = initialize_model(openai_api_key)
 
-    # Scraping process initialization
-    df_initial, most_recent_year = load_existing_data() or (pd.DataFrame(), None)
-    current_year, end_year = int(datetime.utcnow().year), (most_recent_year or CONFIG.BASE_YEAR)
+    existing_result = load_existing_data()
+    df_initial, _most_recent_year = (
+        existing_result if existing_result else (pd.DataFrame(), None)
+    )
 
-    while current_year >= end_year:
-        logging.info(f'[{current_year}] Scraping new drug approvals')
-        response = requests.get(f'{CONFIG.BASE_URL}/{current_year}.html', headers=CONFIG.HEADERS)
-        if response:
-            soup = BeautifulSoup(response.text, 'html.parser')
+    existing_apps = (
+        set(df_initial["application_number"].dropna().astype(str).tolist())
+        if not df_initial.empty and "application_number" in df_initial.columns
+        else set()
+    )
 
-            # Retrieve all drug blocks contained within the main 'ddc-media-list' div
-            all_drugs = soup.select_one('div.ddc-media-list').find_all('div', class_='ddc-media')
+    start_year = 2023
+    end_year = int(datetime.utcnow().year)
 
-            # for drug in tqdm(reversed(all_drugs)):
-            for drug in tqdm(all_drugs):
-                new_data = dict()
+    raw_records = fetch_fda_approvals(start_year, end_year)
+    logging.info(f"Total raw records fetched: {len(raw_records)}")
 
-                # Get the content of the parent div from the current drug
-                drug_tag = drug.find('h3', class_='ddc-media-title')
+    parsed = [parse_fda_record(r) for r in raw_records]
+    new_records = [
+        r for r in parsed if str(r.get("application_number", "")) not in existing_apps
+    ]
+    logging.info(f"New records to classify: {len(new_records)}")
 
-                # Get the drug name
-                drug_name_to_check = drug_tag.find('a').text.strip() if drug_tag.find('a') else drug_tag.text.split('(')[0].strip()
-                logging.info(f"[{current_year}] Processing drug: {drug_name_to_check} [...]")
+    if not new_records:
+        logging.info("Nothing new to process. Exiting.")
+        return
 
-                # Check if the drug name has already been scraped
-                if not df_initial.empty:
-                    has_been_scraped = df_initial.query('drug_name == @drug_name_to_check')
-                    if not has_been_scraped.empty:
-                        logging.info(f"[{current_year}]  Skipping '{drug_name_to_check}' as it has already been scraped.")
-                        continue
+    enriched: list[dict] = []
+    for record in tqdm(new_records, desc="Classifying drugs"):
+        drug_name = record.get("drug_name")
+        mode_administration = record.get("mode_administration")
+        drug_description = record.get("description")
+        drug_treatment = record.get("Treatment for")
 
-                # Add the drug name to the dict
-                new_data['drug_name'] = drug_name_to_check
+        record["drug_type"] = make_classification(
+            categories=DRUG_CATEGORIES,
+            item_description=DRUG_DESCRIPTION,
+            template=DRUG_CLASSIFICATION_TEMPLATE,
+            chat=chat,
+            drug_name=drug_name,
+            mode_administration=mode_administration,
+            drug_description=drug_description,
+            drug_treatment=drug_treatment,
+        )
 
-                # Get the generic name and the mode of administration
-                generic_name, mode_administration = extract_generic_and_admin(str(drug_tag))
-                new_data['drug_generic_name'] = generic_name
-                new_data['mode_administration'] = mode_administration
+        record["disease_type"] = make_classification(
+            categories=DISEASE_CATEGORIES,
+            item_description=DISEASE_DESCRIPTION,
+            template=DISEASE_CLASSIFICATION_TEMPLATE,
+            chat=chat,
+            drug_name=drug_name,
+            drug_treatment=drug_treatment,
+        )
 
-                # Get the description
-                subtitle_tag = drug.find('p', class_='drug-subtitle')
-                description_tag = subtitle_tag.find_next_sibling('p', class_=False)
-                description_text = description_tag.get_text(strip=True) if description_tag else ''
-                description_clean = description_text.replace(';', '').replace('\t', ' ')
-                new_data['description'] = description_clean
+        enriched.append(record)
+        time.sleep(0.2)  # slight pause between LLM calls
 
-                # Iterate through headers to extract key data from <b> tags, which uniquely contain
-                # the metadata like approval date, company name, and treatment information
-                for header in ['Date of Approval:', 'Company:', 'Treatment for:']:
-                    header_tag = drug.find('b', string=header)
-
-                    if header_tag:
-                        # Clean the value by replacing semicolons with commas for 'Treatment for:', otherwise just strip
-                        # whitespace
-                        value = header_tag.next_sibling.strip().replace(';', ',') if header == 'Treatment for:' else header_tag.next_sibling.strip()
-                        new_data[header.split(':')[0]] = value if header != 'Company:' else clean_company_name(value)
-
-                # Perform drug classification
-                new_data['drug_type'] = make_classification(
-                    categories=DRUG_CATEGORIES,
-                    item_description=DRUG_DESCRIPTION,
-                    template=DRUG_CLASSIFICATION_TEMPLATE,
-                    chat=chat,
-                    drug_name=new_data.get('drug_name', None),
-                    mode_administration=new_data.get('mode_administration', None),
-                    drug_description=new_data.get('description', None),
-                    drug_treatment=new_data.get('Treatment for', None),
-                )
-
-                # Perform disease classification
-                new_data['disease_type'] = make_classification(
-                    categories=DISEASE_CATEGORIES,
-                    item_description=DISEASE_DESCRIPTION,
-                    chat=chat,
-                    template=DISEASE_CLASSIFICATION_TEMPLATE,
-                    drug_name=new_data.get('drug_name', None),
-                    drug_treatment=new_data.get('Treatment for', None)
-                )
-
-                # Append new scraped data to the existing CSV
-                new_drug_df = pd.DataFrame([new_data])
-                new_drug_df['Date of Approval'] = pd.to_datetime(new_drug_df['Date of Approval'], format=CONFIG.DATE_FORMAT)
-                df_initial = pd.concat([new_drug_df, df_initial], ignore_index=True)
-
-            current_year -= 1
-
-        else:
-            logging.error(
-                f"[{current_year}] Failed to fetch data. HTTP status code: {response.status_code}. URL: {CONFIG.BASE_URL}/{current_year}.html")
+    df_new = pd.DataFrame(enriched)
+    df_combined = (
+        pd.concat([df_new, df_initial], ignore_index=True)
+        if not df_initial.empty
+        else df_new
+    )
 
     if isinstance(CONFIG, LocalConfig):
-        export_data_to_local(df_initial)
+        export_data_to_local(df_combined)
     elif isinstance(CONFIG, AWSConfig):
-        export_data_to_s3(df_initial)
+        export_data_to_s3(df_combined)
     elif isinstance(CONFIG, GCPConfig):
-        export_data_to_cloud_storage(df_initial)
+        export_data_to_cloud_storage(df_combined)
     else:
         raise RuntimeError(
             f"Invalid CONFIG detected. CONFIG must be an instance of either LocalConfig, AWSConfig, or GCPConfig. "

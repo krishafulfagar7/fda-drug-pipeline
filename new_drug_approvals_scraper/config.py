@@ -17,7 +17,19 @@ class BaseConfig:
     BASE_YEAR = 2002
     LLM_MODEL = 'gpt-4o-mini'
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36", }
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.drugs.com/",
+        "Cache-Control": "max-age=0",
+    }
     BASE_URL = 'https://www.drugs.com/newdrugs-archive'
     DATA_EXPORT_FILENAME = "new_drug_approvals.csv"
 
