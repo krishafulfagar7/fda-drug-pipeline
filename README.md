@@ -1,67 +1,99 @@
-# 🔄 New Drug Approvals Scraper
+# FDA Drug Approval Intelligence Pipeline
 
-This Python package automates the scraping, cleaning, and classification of new drug approval data from [Drugs.com](https://www.drugs.com/newdrugs.html). Designed for robustness and versatility, it integrates data processing techniques with AI-driven classification using OpenAI's GPT-4o-mini, enabling enriched data analysis within dynamic environments like Dash applications.
+> End-to-end data pipeline fetching, classifying, and visualizing FDA drug approval records — built as a work sample for RTW Institute's Data Analyst Internship.
 
-## 🧹 Data Cleaning and Normalization
+---
 
-### 🧽 Cleaning Techniques
+## What This Does
 
-The scraper meticulously extracts and refines data, addressing variations in drug names, generics, and administration methods. Using regular expressions, the `extract_generic_and_admin` function isolates and sanitizes these components, ensuring data uniformity and precision. An example can be seen in the formatting of drug names as shown below:
+This project pulls drug approval data directly from the **official openFDA API** — the same source cited in RTW Institute's research — classifies each drug using a large language model, and visualizes the results in an interactive dashboard.
 
-![Example Drug Name Format](img_readme/example_drug_name.png)
+| Stage | What happens |
+|---|---|
+| **Fetch** | Queries `api.fda.gov/drug/drugsfda.json` for all approval submissions |
+| **Clean** | Parses sponsor names, active ingredients, dosage forms, approval dates |
+| **Classify** | LLaMA 3.3 70B tags each drug by therapeutic type and disease area |
+| **Visualize** | Streamlit dashboard with filters, trend charts, and a disease × drug matrix |
 
-**Key Cleaning Operations:**
-- **Drug Names**: Separating combined names and administration routes using custom regular expressions.
-- **Generics**: Clearing empty parentheses or irrelevant details enclosed within double parentheses.
-- **Administration Methods**: Filtering out non-essential text such as outdated drug names or initial prepositions.
+---
 
-### 🔧 Normalization
+## Key Findings (2023–2026 Data)
 
-Normalization processes target company names that often appear with slight variations in formatting, punctuation, or presentation. Using the `clean_company_name` function, we standardize these names to reduce the complexity and ensure consistency across the dataset. Here’s how specific issues are addressed:
+- **9,998 records fetched** from openFDA · **2,550 fully classified** (API rate limit on free tier — pipeline is resumable)
+- **Small molecules dominate** at 52% of classified drugs, but biologics, monoclonal antibodies, and RNA therapies show meaningful growth
+- **Psychiatry, Infectious Disease, and Cardiovascular** are the top three disease areas — reflecting both high generic filing volume and sustained post-COVID pipeline activity
+- **Approval volume grew** from 512 records in 2023 to 912 in 2025, with 2026 on pace to match
+- **565 unique sponsor companies** — top 10 account for a disproportionate share, consistent with pharma consolidation trends
 
-- **Removing Redundant Suffixes**: Strips common corporate suffixes like "Inc.", "Ltd.", "Corp.", "Corporation", and others to maintain a clean, uniform database.
-- **Unifying Abbreviations and Full Names**: Converts abbreviations to their full forms and ensures that variations in company names are standardized to a single, consistent format.
-- **Standardizing Collaboration Descriptions**: Variations in the representation of collaboration between companies, such as "and", "&", "+", "/", are unified to "and" to maintain consistency in joint ventures or co-developed products.
+---
 
-**Example Transformations:**
+## Why It's Relevant to RTW Institute
 
-| Original Company Name                                   | Normalized Company Name |
-|---------------------------------------------------------|-------------------------|
-| Pfizer, Inc.                                            | Pfizer                  |
-| Pfizer Inc.                                             | Pfizer                  |
-| AMAG Pharmaceuticals, Inc.                              | AMAG Pharmaceuticals    |
-| AFT Pharmaceuticals Ltd.                                | AFT Pharmaceuticals     |
-| ALK-Abelló A/S                                          | ALK-Abelló              |
-| GSK                                                     | GlaxoSmithKline         |
-| GlaxoSmithKline PLC                                     | GlaxoSmithKline         |
-| Amgen, Inc.                                             | Amgen                   |
-| Daiichi Sankyo Company, Limited                         | Daiichi Sankyo          |
-| AstraZeneca and Daiichi Sankyo Company, Limited         | AstraZeneca and Daiichi Sankyo |
-| Bristol-Myers Squibb Company / Gilead Sciences, Inc.    | Bristol-Myers Squibb Company and Gilead Sciences |
-| Boehringer Ingelheim Pharmaceuticals, Inc. and Eli Lilly| Boehringer Ingelheim Pharmaceuticals and Eli Lilly |
+RTW Institute focuses on two areas — **drug innovation incentives** and **healthcare affordability**. This pipeline directly supports both:
 
-These methods enhance the reliability of data for subsequent analyses by ensuring that each entity is represented uniformly, reducing the number of unique company names from approximately 1000 to 700.
+- Tracking novel approvals (NDA/BLA) vs. generics (ANDA) shows whether innovation incentives are translating into new treatments
+- Monitoring approval volume by therapeutic modality (small molecule vs. biologic) informs policy discussions around different regulatory pathways
+- Integrating CMS NADAC pricing data (planned next step) would enable direct drug cost analysis alongside approval trends
 
+---
 
-## 🏷️ Data Classification with AI
+## Dashboard
 
-Utilizing LangChain integrated with OpenAI's GPT-3.5 Turbo, the scraper enriches the extracted data by categorizing medications and their treatment categories. This process not only simplifies complex medical information but also facilitates insightful trend analysis across various disease treatments. The integration with LangChain allows dynamic interaction with data, applying logical rules to categorize drugs based on their detailed descriptions and intended uses.
+Built with Streamlit + Plotly. Features:
+- Year range filter (sidebar)
+- Drug type filter
+- Approvals over time (area chart)
+- Drug type breakdown (donut chart)
+- Approvals by disease area (bar chart)
+- Top 10 companies by approvals
+- Disease area × drug type heatmap
 
-## 📦 Package Structure and Versatility
+**Run locally:**
+```bash
+pip install streamlit plotly pandas
+streamlit run streamlit_app.py
+```
 
-The scraper is structured as a Python package, enabling it to function independently or as part of larger systems:
+---
 
-- `scraper.py`: Handles data collection logic.
-- `classification.py`: Manages AI-driven data categorization.
-- `utils.py`: Provides utility functions for data manipulation.
-- `init.py`: Initializes the directory as a Python package for easy import.
+## Repo Structure
 
-## 🔄 Using the Scraper
+```
+fda-drug-pipeline/
+├── new_drug_approvals_scraper/   # Core scraper package (openFDA API)
+├── data/
+│   ├── new_drug_approvals.csv    # Raw fetched records (~10k rows)
+│   └── clean_approvals.csv       # Classified subset (2,550 rows)
+├── streamlit_app.py              # Interactive dashboard
+├── fill_classifications.py       # LLM classification script (Groq API)
+├── requirements.txt
+└── README.md
+```
 
-To use the scraper, manage the OpenAI API key through one of the following methods:
-1. **Environment Variable**: Store the API key in an environment variable which the scraper accesses.
-2. **Direct Specification**: Directly pass the API key to the function when invoking it.
+---
 
-## 🌐 Example Integration
+## Tech Stack
 
-For a live example of how this scraper package is utilized within a Dash ecosystem to provide real-time updates on drug approvals, visit the [New Drug Approvals Dashboard repository](https://github.com/Tanguy9862/new-drug-approvals-dashboard).
+| Component | Tool |
+|---|---|
+| Data source | openFDA Drug Applications API |
+| Data processing | Python · pandas |
+| LLM classification | LLaMA 3.3 70B via Groq API |
+| Dashboard | Streamlit · Plotly |
+| Language | Python 3.14 |
+
+---
+
+## Limitations & Next Steps
+
+Classification was completed on 2,550 of 9,998 records due to Groq's free-tier daily token limit (100k tokens/day). The pipeline tracks already-classified records and resumes where it left off — full classification would take ~2 hours with production API access.
+
+Planned extensions:
+- CMS NADAC pricing integration for affordability analysis
+- NDA vs. ANDA vs. BLA breakdown
+- Full historical dataset back to 2002
+- Public dashboard deployment
+
+---
+
+*Data: openFDA Drug Applications API · Classification: LLaMA 3.3 70B via Groq · Built May 2026*
